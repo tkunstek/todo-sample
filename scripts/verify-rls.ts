@@ -3,7 +3,10 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js'
 
 const URL = process.env.SUPABASE_TEST_URL
 const SERVICE_KEY = process.env.SUPABASE_TEST_SERVICE_KEY
+const ANON_KEY_RAW = process.env.VITE_SUPABASE_ANON_KEY
 if (!URL || !SERVICE_KEY) throw new Error('Set SUPABASE_TEST_URL and SUPABASE_TEST_SERVICE_KEY')
+if (!ANON_KEY_RAW) throw new Error('Set VITE_SUPABASE_ANON_KEY (the anon key, NOT the service key — user-scoped clients must run under RLS)')
+const ANON_KEY: string = ANON_KEY_RAW
 
 const PASSWORD = 'verify-rls-fixture-pw-1!'
 
@@ -63,7 +66,7 @@ async function ensureUser(email: string): Promise<string> {
   return found.id
 }
 async function signIn(email: string): Promise<SupabaseClient> {
-  const client = createClient(URL!, process.env.VITE_SUPABASE_ANON_KEY ?? SERVICE_KEY!, {
+  const client = createClient(URL!, ANON_KEY, {
     auth: { persistSession: false },
   })
   const { error } = await client.auth.signInWithPassword({ email, password: PASSWORD })
@@ -71,21 +74,25 @@ async function signIn(email: string): Promise<SupabaseClient> {
   return client
 }
 
-const uids: Record<FixtureKey, string> = {} as Record<FixtureKey, string>
+const uids: Record<FixtureKey, string> = {
+  acmeAdmin: '', acmeMember: '', globexAdmin: '', globexMember: '', superAdmin: '',
+}
 const ids = {
   acme: '', globex: '', system: '',
   acmeTeam1: '', acmeTeam2: '', globexTeam1: '', globexTeam2: '',
 }
 
 async function wipe() {
-  // Order respects FKs; CASCADE covers the rest. auth.users is NOT touched.
-  await Promise.resolve(admin.rpc('noop')).catch(() => {}) // no-op guard if rpc missing
+  // auth.users is NOT touched. Order respects FKs; CASCADE covers the rest.
   for (const t of ['todos', 'lists', 'team_members', 'teams', 'profiles', 'organizations']) {
     const { error } = await admin.from(t).delete().neq('id', '00000000-0000-0000-0000-000000000000')
-      .then((r) => r, (e) => ({ error: e }))
-    // team_members has no id column; fall back to truncate via rpc-less delete on its PK
-    if (error && t === 'team_members') {
-      await admin.from('team_members').delete().not('team_id', 'is', null)
+      .then((r) => r, (e) => ({ error: e as Error }))
+    if (error) {
+      if (t === 'team_members') {
+        await admin.from('team_members').delete().not('team_id', 'is', null)
+      } else {
+        throw new Error(`wipe failed on ${t}: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
   }
 }
@@ -160,7 +167,7 @@ async function seedListsAndTodos(clients: Record<FixtureKey, SupabaseClient>) {
 }
 
 async function runAssertions(clients: Record<FixtureKey, SupabaseClient>) {
-  const anon = createClient(URL!, process.env.VITE_SUPABASE_ANON_KEY ?? SERVICE_KEY!, {
+  const anon = createClient(URL!, ANON_KEY, {
     auth: { persistSession: false },
   })
   const m = clients.acmeMember, a = clients.acmeAdmin, s = clients.superAdmin

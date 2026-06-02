@@ -4,16 +4,19 @@ A reference implementation of [TodoMVC](https://todomvc.com/) built as a **learn
 
 This project is a scaled-down sibling of the SHA.TESSERA / momentum codebase. The architecture mirrors the production stack one-to-one (service layer, React Query, RLS, migration discipline, type generation, design tokens). The domain is intentionally trivial so the architecture stays in the foreground.
 
+**Sub-project A (multi-tenant data foundation + RLS) is now implemented.** The Postgres schema, all 15 migrations, SECURITY DEFINER helpers, triggers, RLS policies, bootstrap script, and `verify:rls` harness are on disk and the Netlify deploy shell is wired up. See `docs/superpowers/specs/2026-05-19-multi-tenant-data-foundation-design.md` for the full design rationale. Sub-projects B (auth + role context), C (list/todo UX), D (org admin), and E (super admin) build on top of this foundation.
+
 ---
 
 ## What you'll learn by reading this codebase
 
 1. **How a typed React + Supabase app is wired up** — from the database schema down to the generated `database.types.ts`, up through services, hooks, and components.
-2. **How Row Level Security (RLS) replaces application-layer authorization** — every user only sees their own todos, enforced by Postgres, not by `if (todo.user_id === currentUser.id)` checks scattered in the UI.
-3. **How React Query separates server state from UI state** — and why that distinction matters.
-4. **How Zod + React Hook Form validate user input safely** without trusting the client.
-5. **How the Supabase CLI manages cloud-only migrations** — idempotent SQL, generated types, no local Postgres required.
-6. **How a small, consistent design system stays small and consistent** — design tokens, SCSS mixins, a Stylelint gate.
+2. **How Row Level Security (RLS) replaces application-layer authorization** — every user only sees their own data, enforced by Postgres, not by `if (todo.user_id === currentUser.id)` checks scattered in the UI.
+3. **How multi-tenant isolation works end-to-end** — organizations, teams, and per-table policies written once in SQL, tested with real signed-in JWTs.
+4. **How React Query separates server state from UI state** — and why that distinction matters.
+5. **How Zod + React Hook Form validate user input safely** without trusting the client.
+6. **How the Supabase CLI manages cloud-only migrations** — idempotent SQL, generated types, no local Postgres required.
+7. **How a small, consistent design system stays small and consistent** — design tokens, SCSS mixins, a Stylelint gate.
 
 If you've read the momentum CLAUDE.md and want to see those rules applied in a project you can hold in your head, this is that project.
 
@@ -45,111 +48,106 @@ d2-todo-sample/
 ├── package.json
 ├── tsconfig.json
 ├── vite.config.ts
-├── .env.example               # SUPABASE_URL + SUPABASE_ANON_KEY
+├── netlify.toml               # Netlify build config (dist/, SPA redirect)
+├── .env.example               # all env vars (VITE_ prefix for browser; bare for scripts)
 ├── supabase/
-│   ├── migrations/            # YYYYMMDDHHmmss_description.sql
-│   │   ├── 20260101000001_create_todos.sql
-│   │   ├── 20260101000002_enable_rls_on_todos.sql
-│   │   └── 20260101000003_create_todo_rls_policies.sql
-│   └── config.toml
+│   ├── config.toml
+│   ├── bootstrap/
+│   │   └── seed_first_super_admin.sql   # one-shot post-deploy bootstrap (NOT a migration)
+│   └── migrations/            # 15 idempotent migrations, applied in order
+│       ├── 20260519100001_create_organizations.sql
+│       ├── 20260519100002_create_profiles.sql
+│       ├── 20260519100003_create_teams.sql
+│       ├── 20260519100004_create_team_members.sql
+│       ├── 20260519100005_create_lists.sql
+│       ├── 20260519100006_alter_todos_for_lists.sql
+│       ├── 20260519100007_create_rls_helpers.sql
+│       ├── 20260519100008_create_triggers.sql
+│       ├── 20260519100009_enable_rls.sql
+│       ├── 20260519100010_create_profiles_policies.sql
+│       ├── 20260519100011_create_organizations_policies.sql
+│       ├── 20260519100012_create_teams_policies.sql
+│       ├── 20260519100013_create_team_members_policies.sql
+│       ├── 20260519100014_create_lists_policies.sql
+│       └── 20260519100015_create_todos_policies.sql
+├── scripts/
+│   ├── verify-rls.ts          # real-JWT RLS isolation test (npm run verify:rls)
+│   └── bootstrap-first-admin.ts  # wrapper for seed_first_super_admin.sql
 ├── src/
-│   ├── main.tsx               # React root, QueryClientProvider, AuthProvider
-│   ├── App.tsx                # Router + AuthGate
+│   ├── main.tsx               # React root (placeholder; AuthProvider added in sub-project B)
+│   ├── App.tsx                # smoke page — renders anon-read result via service seam
 │   ├── lib/
-│   │   └── supabase.ts        # createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
-│   ├── contexts/
-│   │   └── AuthContext.tsx    # session state, login/logout, useAuth() hook
+│   │   └── supabase.ts        # the single browser Supabase client (anon key)
 │   ├── services/
-│   │   ├── todoService.ts     # all DB reads/writes for todos
-│   │   └── todoService.test.ts
-│   ├── hooks/
-│   │   ├── useTodos.ts        # React Query wrapper around todoService.list()
-│   │   └── useMutateTodo.ts   # create / update / delete mutations
-│   ├── components/
-│   │   ├── TodoList/
-│   │   │   ├── TodoList.tsx
-│   │   │   ├── TodoList.scss
-│   │   │   └── TodoList.test.tsx
-│   │   ├── TodoItem/
-│   │   ├── TodoInput/
-│   │   └── FilterBar/         # all / active / completed
-│   ├── pages/
-│   │   ├── LoginPage.tsx
-│   │   └── TodoPage.tsx
-│   ├── styles/
-│   │   ├── tokens.css         # CSS custom properties (colors, spacing, radii)
-│   │   ├── _mixins.scss       # SCSS mixins (e.g. @include button-primary;)
-│   │   └── global.scss
+│   │   └── rlsSmokeService.ts # service seam for the deploy smoke read
 │   ├── types/
-│   │   └── database.types.ts  # generated by `supabase gen types`
-│   └── utils/
-│       └── schemas.ts         # Zod schemas (TodoCreateSchema, TodoUpdateSchema)
-└── tests/
-    └── setup.ts
+│   │   └── database.types.ts  # placeholder — regenerate with `npm run gen:types`
+│   └── (hooks/, components/, pages/, contexts/, styles/, utils/ — added in sub-projects B/C)
+└── docs/superpowers/
+    ├── specs/2026-05-19-multi-tenant-data-foundation-design.md
+    └── plans/2026-06-02-multi-tenant-data-foundation.md
 ```
 
 The structure is deliberately the same shape as momentum, just smaller. The mapping is:
 
 | momentum | d2-todo-sample |
 |---|---|
-| `src/services/contactService.ts` (and friends) | `src/services/todoService.ts` |
-| `src/hooks/useContacts.ts` | `src/hooks/useTodos.ts` |
+| `src/services/contactService.ts` (and friends) | `src/services/rlsSmokeService.ts` (placeholder; list/todo services in sub-project C) |
+| `src/hooks/useContacts.ts` | `src/hooks/use*.ts` (added in sub-projects B/C) |
 | `src/features/*` | (collapsed — only one feature exists) |
-| `src/styles/theme.css` | `src/styles/tokens.css` |
-| `src/styles/_momentum-tokens.scss` | `src/styles/_mixins.scss` |
+| `src/styles/theme.css` | `src/styles/tokens.css` (added in sub-project B) |
+| `src/styles/_momentum-tokens.scss` | `src/styles/_mixins.scss` (added in sub-project B) |
 | `supabase/migrations/` | `supabase/migrations/` (same convention) |
 
 ---
 
 ## Data model
 
-One table. That's the point.
+Six tables form the foundation of the multi-tenant design. The full schema with constraints, triggers, and indexes is in `supabase/migrations/`. The design spec at `docs/superpowers/specs/2026-05-19-multi-tenant-data-foundation-design.md` documents every architectural decision.
 
-```sql
-CREATE TABLE public.todos (
-  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id     UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  title       TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 280),
-  is_complete BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+### Tables and relationships
 
-CREATE INDEX todos_user_id_idx ON public.todos(user_id);
 ```
+organizations          (id, name, slug, created_at, updated_at)
+  └── profiles         (id → auth.users, org_id, role, is_super_admin, display_name, ...)
+        └── team_members  (team_id, user_id)  ──┐
+  └── teams            (id, org_id, name, ...)   │
+        └── team_members ─────────────────────────┘
+  └── lists            (id, org_id, owner_user_id XOR owner_team_id, created_by, name, ...)
+        └── todos       (id, list_id, title, is_complete, ...)
+```
+
+Key invariants:
+
+- **One org per user.** `profiles.org_id` is `NOT NULL`. Users are assigned to exactly one organization.
+- **Lists have a polymorphic owner.** `owner_user_id` and `owner_team_id` are both nullable, but exactly one must be set (`CONSTRAINT lists_owner_xor`). A list belongs to either a user (personal) or a team.
+- **`lists.org_id` is denormalized** — filled by a `BEFORE INSERT` trigger from the owner's org so the org-admin policy is a single indexed comparison (`org_id = current_org_id()`).
+- **`lists.created_by`** is `nullable` with `ON DELETE SET NULL`. It records who created the list (audit metadata) without blocking team-list survival when the creator's profile is deleted.
+- **`todos` hang off `lists`** via a `NOT NULL` FK. There is no `user_id` on `todos`.
 
 ### Row Level Security
 
-RLS is the most important pattern in this sample. Without it, **any authenticated user could read or write any other user's todos** by tampering with API calls — the anon key is public, and the client is fully under user control. RLS moves the access check into Postgres, where the user can't bypass it.
+RLS is the most important pattern in this sample. The anon key is public and the client is hostile. Authorization lives entirely in Postgres policies — there are no `if (resource.user_id === currentUser.id)` checks in TypeScript.
 
-```sql
-ALTER TABLE public.todos ENABLE ROW LEVEL SECURITY;
+All six tables have RLS enabled. The policies are split per operation (`SELECT / INSERT / UPDATE / DELETE`), scoped `TO authenticated`, and backed by seven `SECURITY DEFINER` helper functions:
 
-CREATE POLICY "todos_select_own" ON public.todos
-  FOR SELECT TO authenticated
-  USING (user_id = (select auth.uid()));
+| Helper | Purpose |
+|---|---|
+| `is_super_admin()` | `true` if the caller's profile has `is_super_admin = true` |
+| `is_org_admin()` | `true` if the caller's profile has `role = 'org_admin'` |
+| `current_org_id()` | the caller's `profiles.org_id` |
+| `is_team_member(team_id)` | `true` if the caller is in `team_members` for that team |
+| `can_read_list(list_id)` | owner, team member, org admin (read-only on personal lists), or super admin |
+| `can_write_list(list_id)` | owner, team member with write, org admin on team lists, or super admin |
+| `can_manage_team_member(team_id, user_id)` | both team AND user must be in the actor's own org |
 
-CREATE POLICY "todos_insert_own" ON public.todos
-  FOR INSERT TO authenticated
-  WITH CHECK (user_id = (select auth.uid()));
-
-CREATE POLICY "todos_update_own" ON public.todos
-  FOR UPDATE TO authenticated
-  USING (user_id = (select auth.uid()))
-  WITH CHECK (user_id = (select auth.uid()));
-
-CREATE POLICY "todos_delete_own" ON public.todos
-  FOR DELETE TO authenticated
-  USING (user_id = (select auth.uid()));
-```
+The `todos` SELECT policy delegates entirely to `can_read_list(list_id)`. This is intentional and has a performance consequence — see the **Todos query constraint** invariant in CLAUDE.md.
 
 Notes:
 
-- `(select auth.uid())` is wrapped in a subselect — Postgres caches it once per query rather than calling it per row. This matters at scale and is the convention we use everywhere.
-- Policies are scoped `TO authenticated` so the `anon` role gets nothing.
-- Separate policies for SELECT / INSERT / UPDATE / DELETE — easier to reason about than one combined policy.
-
-In momentum, this same pattern is generalized as `public.apply_tenant_rls_policies('table_name')`. We don't need tenants here, so the policies are hand-written. The shape is identical.
+- `(select auth.uid())` is used inside every policy (subselect form) so Postgres caches it once per query rather than calling it per row.
+- Policies are scoped `TO authenticated` so the `anon` role gets nothing (RLS default-deny).
+- The `profiles` UPDATE policy is backed by an explicit column grant: only `display_name` and `updated_at` are writable by the authenticated role. `role`, `org_id`, and `is_super_admin` cannot be set from the client under any circumstances.
 
 ---
 
@@ -163,105 +161,80 @@ All Supabase calls go through `src/services/`. Components and hooks never `impor
 - Error shapes are translated once, in one place.
 - Swapping the backend later (or splitting one service into many) is a localized change.
 
-```ts
-// src/services/todoService.ts
-import { supabase } from '@/lib/supabase';
-import type { Database } from '@/types/database.types';
+The existing service in sub-project A is `src/services/rlsSmokeService.ts` — a minimal proof-of-concept. Sub-project C will add the real list and todo services. When it does, every `todos` query **must** be scoped by `list_id` and paginated (see the todos query constraint in CLAUDE.md). An illustrative skeleton:
 
-type Todo = Database['public']['Tables']['todos']['Row'];
-type TodoInsert = Database['public']['Tables']['todos']['Insert'];
+```ts
+// src/services/todoService.ts  (sub-project C)
+import { supabase } from '../lib/supabase'
+import type { Database } from '../types/database.types'
+
+type Todo = Database['public']['Tables']['todos']['Row']
+type TodoInsert = Database['public']['Tables']['todos']['Insert']
 
 export const todoService = {
-  async list(): Promise<Todo[]> {
+  async listForList(listId: string, page = 0, pageSize = 50): Promise<Todo[]> {
     const { data, error } = await supabase
       .from('todos')
       .select('*')
-      .order('created_at', { ascending: false });
-    if (error) throw error;
-    return data;
+      .eq('list_id', listId)          // REQUIRED — never omit list_id
+      .order('created_at', { ascending: false })
+      .range(page * pageSize, (page + 1) * pageSize - 1)
+    if (error) throw error
+    return data
   },
 
-  async create(input: Pick<TodoInsert, 'title'>): Promise<Todo> {
+  async create(input: Pick<TodoInsert, 'list_id' | 'title'>): Promise<Todo> {
     const { data, error } = await supabase
-      .from('todos')
-      .insert(input)
-      .select()
-      .single();
-    if (error) throw error;
-    return data;
+      .from('todos').insert(input).select().single()
+    if (error) throw error
+    return data
   },
-
-  async toggle(id: string, isComplete: boolean): Promise<void> {
-    const { error } = await supabase
-      .from('todos')
-      .update({ is_complete: isComplete })
-      .eq('id', id);
-    if (error) throw error;
-  },
-
-  async remove(id: string): Promise<void> {
-    const { error } = await supabase.from('todos').delete().eq('id', id);
-    if (error) throw error;
-  },
-};
+}
 ```
 
-Note `user_id` is **never set by the client** — the column is defaulted in a separate migration via a `BEFORE INSERT` trigger that fills it from `auth.uid()`. This means the client physically cannot insert a row attributed to another user, even before RLS rejects the insert. Belt and suspenders.
+Note `list_id` is required on every insert and every `SELECT`. The `todos` SELECT policy delegates to `can_read_list(list_id)` — an unbounded `select * from todos` re-evaluates that helper for each distinct `list_id` across the caller's entire tenant, which is expensive.
 
 ### 2. React Query for server state
 
-Every read goes through a hook that wraps the service:
+React Query hooks (`src/hooks/use*.ts`) will be added in sub-projects B and C. The pattern, when implemented: every read goes through a hook that wraps a service function, every write goes through a mutation that invalidates the relevant query keys, and components only see `isLoading`, `data`, `error`.
 
 ```ts
-// src/hooks/useTodos.ts
-import { useQuery } from '@tanstack/react-query';
-import { todoService } from '@/services/todoService';
+// src/hooks/useTodos.ts  (sub-project C — illustrative)
+import { useQuery } from '@tanstack/react-query'
+import { todoService } from '../services/todoService'
 
-export function useTodos() {
+export function useTodos(listId: string) {
   return useQuery({
-    queryKey: ['todos'],
-    queryFn: todoService.list,
+    queryKey: ['todos', listId],
+    queryFn: () => todoService.listForList(listId),
     staleTime: 30_000,
-  });
+  })
 }
 ```
 
-Every write goes through a mutation that invalidates the relevant query keys:
-
-```ts
-// src/hooks/useMutateTodo.ts
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { todoService } from '@/services/todoService';
-
-export function useCreateTodo() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: todoService.create,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['todos'] }),
-  });
-}
-```
-
-Components never know if data came from the network or the cache. They only see `isLoading`, `data`, `error`.
+The query key always includes `listId` so React Query caches per-list, not per-tenant.
 
 ### 3. Zod for validation, inferred for types
 
+`src/utils/schemas.ts` (added in sub-project C) will hold all Zod schemas. The pattern:
+
 ```ts
-// src/utils/schemas.ts
-import { z } from 'zod';
+// src/utils/schemas.ts  (sub-project C — illustrative)
+import { z } from 'zod'
 
 export const TodoCreateSchema = z.object({
+  list_id: z.string().uuid(),
   title: z.string().trim().min(1, 'Title is required').max(280),
-});
+})
 
-export type TodoCreateInput = z.infer<typeof TodoCreateSchema>;
+export type TodoCreateInput = z.infer<typeof TodoCreateSchema>
 ```
 
-The form uses `zodResolver(TodoCreateSchema)`. The service accepts `TodoCreateInput`. The DB also enforces the length constraint. Three layers of validation, one source of truth.
+The form uses `zodResolver(TodoCreateSchema)`. The service accepts `TodoCreateInput`. The DB enforces the same length constraint via `CHECK (length(title) BETWEEN 1 AND 280)`. Three layers of validation, one source of truth.
 
 ### 4. Auth context
 
-`AuthContext` exposes `{ user, session, signIn, signOut }` and renders nothing until the initial session check resolves. `App.tsx` reads it and either renders `<LoginPage />` or `<TodoPage />`. There is no role-based authorization in this sample — every authenticated user has the same powers (over their own data).
+`AuthContext` (added in sub-project B) will expose `{ user, session, profile, signIn, signOut }`. `profile` carries the tenant-aware fields (`org_id`, `role`, `is_super_admin`) so components can derive what the current user is permitted to see without making additional DB calls. Until sub-project B lands, there is no in-app auth — use the Supabase dashboard to manage users.
 
 ### 5. Design tokens
 
@@ -284,16 +257,22 @@ git clone <this-repo>
 cd d2-todo-sample
 npm install
 
-# 1. Create a new Supabase project at https://supabase.com/dashboard
-# 2. Copy the project URL and anon key into .env
+# 1. Create a Supabase project at https://supabase.com/dashboard.
+#    Note the project URL, anon key, service_role key, and DB connection string.
 cp .env.example .env
+# Fill in VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY,
+#          SUPABASE_TEST_URL, SUPABASE_TEST_SERVICE_KEY, SUPABASE_DB_URL
 
-# 3. Link the CLI to your project
+# 2. Link the CLI to your project
 supabase login
 supabase link --project-ref <your-project-ref>
 
-# 4. Push migrations
+# 3. Push all 15 migrations
 npm run supabase:apply
+
+# 4. Seed the first super admin (run once after first deploy)
+#    Create a user in the Supabase dashboard (Auth → Users), copy its UID.
+npm run bootstrap:first-admin -- --uid '<uid-from-dashboard>' --org 'System'
 
 # 5. Generate TypeScript types from the cloud schema
 npm run gen:types
@@ -302,7 +281,7 @@ npm run gen:types
 npm run dev
 ```
 
-Sign up via the Supabase dashboard (or wire up sign-up in `LoginPage.tsx` — left as an exercise) and start creating todos.
+There is no in-app sign-up flow yet (sub-project B). Users are provisioned by service role during the invite flow (sub-projects D/E); the bootstrap script is the only mechanism in sub-project A for seeding a user into an org.
 
 ### Adding a database change
 
@@ -345,25 +324,58 @@ npm run test:coverage
 npm run supabase:apply   # supabase db push
 npm run gen:types        # supabase gen types typescript --linked > src/types/database.types.ts
 npm run db:psql          # psql against $SUPABASE_DB_URL for ad-hoc reads
+
+npm run verify:rls       # real-JWT RLS isolation test (needs .env with test project creds)
+npm run bootstrap:first-admin -- --uid <uid> --org <name>  # seed first super admin
 ```
+
+### `verify:rls` workflow
+
+`verify:rls` (`scripts/verify-rls.ts`) proves tenant isolation end-to-end against a real Supabase project using real signed-in JWTs. It cannot be mocked — `auth.uid()` inside Postgres is only populated for a genuine session.
+
+**Required env vars** (all in `.env`, never committed):
+
+```dotenv
+SUPABASE_TEST_URL=https://<ref>.supabase.co
+SUPABASE_TEST_SERVICE_KEY=<service_role key>
+VITE_SUPABASE_ANON_KEY=<anon key>
+```
+
+The harness creates five fixture users (or reuses them), wipes all tenant data, seeds two orgs and four teams, creates lists and todos via each owner's authenticated session (so triggers fire with a real `auth.uid()`), and runs ~30 assertions covering personal/team list visibility, cross-org isolation, org-admin read-only-on-personal, cross-org `team_members` rejection, profile column tamper-proofing, and trigger-driven `org_id`/`created_by` derivation.
+
+> Use a **dedicated test project** — the harness truncates all six tables on every run.
+
+### Bootstrap procedure
+
+The bootstrap script (`scripts/bootstrap-first-admin.ts`) wraps `supabase/bootstrap/seed_first_super_admin.sql` via `psql`. It is run **once** after first deploy:
+
+```bash
+# 1. Create the user in the Supabase dashboard (Auth → Users). Copy the UID.
+# 2. Run:
+npm run bootstrap:first-admin -- --uid '<uid>' --org 'System'
+# Expected output: psql prints INSERT 0 1 (or INSERT 0 0 on a repeat idempotent run).
+```
+
+The SQL is idempotent: if the org or profile already exists it does nothing. The bootstrap file is **not** in the numbered migration chain — it is a one-shot seed and must never be applied by `supabase db push`.
 
 ---
 
-## What is intentionally NOT in this sample
+## What is intentionally NOT yet in this sample
 
-To keep the codebase readable, several patterns from momentum were left out:
+Sub-project A delivers the data foundation. The following are out of scope until later sub-projects:
 
-| Omitted | Why | Where to look in momentum if you want to see it |
+| Omitted | Planned in | Notes |
 |---|---|---|
-| Multi-tenancy | One user per account is enough to demonstrate RLS; tenants add a layer of indirection that obscures the simpler per-user case. | `supabase/migrations/20260204120002_create_tenant_rls_template.sql` and `public.apply_tenant_rls_policies()` |
-| Role-based authorization | All authenticated users have identical permissions over their own data. | momentum's `organization_admin / executive / analyst` roles in `AuthContext` |
-| Edge Functions | No server-side logic is needed. | `supabase/functions/` in momentum |
-| Realtime subscriptions | Polling via React Query's `staleTime` is enough. Adding Supabase Realtime is a one-hook change if you want to try it. | — |
-| E2E tests (Playwright) | Unit + component tests are enough at this scale. | `tests/` (planned) in momentum |
-| A formal design system page | The token file + Stylelint enforces the rules. | `../s2shape/src/components/admin/design-system/` |
-| Routing beyond two routes | One auth-gated page is the entire app. | — |
+| `AuthContext` and route guards | Sub-project B | No in-app login/logout yet. Auth happens in the Supabase dashboard during development. |
+| List/todo UI | Sub-project C | The placeholder `App.tsx` only proves RLS returns 0 rows for anon. |
+| User invitation and org management UI | Sub-project D | Users are provisioned by service role only (or the bootstrap script for the first admin). |
+| Super admin console | Sub-project E | Cross-org actions are service-role only today. |
+| Edge Functions | — | No server-side logic is needed for the current scope. |
+| Realtime subscriptions | — | Polling via React Query's `staleTime` is enough. Supabase Realtime is a one-hook change. |
+| E2E tests (Playwright) | — | Unit + component tests are enough at this scale. |
+| A formal design system page | Sub-project B | Design tokens and Stylelint will be wired up when the real UI arrives. |
 
-Each of these is a one-day extension if you want to use this codebase as a starting point for something larger.
+Each of these is a one-sub-project extension. The data foundation (RLS, triggers, policies) is already tested and in place.
 
 ---
 
@@ -371,13 +383,13 @@ Each of these is a one-day extension if you want to use this codebase as a start
 
 If you're using this as a learning project, here is a rough difficulty curve:
 
-1. **Easy** — Add a "clear completed" button. Wire it through `todoService` and React Query.
-2. **Easy** — Add filter persistence to the URL (`?filter=active`).
-3. **Medium** — Add an `priority` column (low / medium / high) via a new migration. Update the Zod schema, types, service, and UI.
-4. **Medium** — Add optimistic updates to the toggle mutation. Compare UX before and after.
-5. **Medium** — Replace polling with Supabase Realtime. Notice what changes (and what doesn't) thanks to React Query.
-6. **Hard** — Add a `lists` table (one user → many lists, one list → many todos). Migrate the existing `todos.user_id` to `todos.list_id` and update RLS to scope by list ownership. Write the migration to be reversible.
-7. **Hard** — Add a second authenticated role ("collaborator") who can see a list but not delete from it. This is the on-ramp to momentum-style role-based RLS.
+1. **Easy** — Run `npm run verify:rls` against your own Supabase test project and read through `scripts/verify-rls.ts`. Trace each assertion back to the policy that enforces it.
+2. **Easy** — Add a `priority` column to `todos` via a new migration (migration 16+). Update the generated types and the smoke service. Practice the append-only, idempotent migration discipline.
+3. **Medium** — Implement sub-project B: wire up `AuthContext`, sign-in/sign-out, and route guards. The data foundation is already in place — you only need the React layer.
+4. **Medium** — Implement the list/todo UI (sub-project C). Use the existing service-layer seam. Pay attention to the todos query constraint — scope every `todos` query by `list_id`.
+5. **Medium** — Add optimistic updates to the todo toggle mutation. Compare UX before and after.
+6. **Hard** — Implement the org admin console (sub-project D): user invitation flow, team creation, membership management. The RLS policies already enforce the boundaries; your job is the UI and service layer.
+7. **Hard** — Add a "collaborator" role to `lists` (read-only access for invited users who are not team members). This requires a new table, new RLS helper, and updated policies — without touching any already-applied migration.
 
 ---
 

@@ -1,0 +1,37 @@
+{
+  "name": "d2-todo-sample",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "A reference implementation of TodoMVC built as a learning tool.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "lint": "eslint .",
+    "lint:styles": "stylelint \"src/**/*.scss\"",
+    "lint:styles:fix": "stylelint \"src/**/*.scss\" --fix",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "supabase:apply": "supabase db push",
+    "gen:types": "supabase gen types typescript --linked > src/types/database.types.ts",
+    "db:psql": "psql \"$SUPABASE_DB_URL\"",
+    "verify:rls": "tsx scripts/verify-rls.ts",
+    "bootstrap:first-admin": "tsx scripts/bootstrap-first-admin.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.107.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.16",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "dotenv": "^17.4.2",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16"
+  }
+}

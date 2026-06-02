@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+.DS_Store
+src/types/database.types.ts.bak
+.claude-agent-role
+.claude-agent-meta

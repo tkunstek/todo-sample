@@ -2,7 +2,18 @@
 
 **Date:** 2026-05-19
 **Sub-project:** A (of a six-sub-project program — see "Program context" below)
-**Status:** Approved, ready for implementation planning
+**Status:** Revised 2026-06-02 after Codex adversarial review — ready for implementation planning
+
+> **Revision 2026-06-02.** Folded the must-fix findings from the Codex review
+> (`2026-06-02-multi-tenant-data-foundation-codex-review.md`) into this spec:
+> - **#1** — bootstrap moved out of the numbered migration chain into `supabase/bootstrap/`.
+> - **#8** — `verify:rls` seed creates lists/todos via each owner's authenticated session (not service role), so the `created_by`/`org_id` triggers fire with a real `auth.uid()`.
+> - **#9** — `lists.created_by` is now nullable with `ON DELETE SET NULL`; the owner-change trigger allows the cascade-driven `→ NULL` transition but still blocks client reassignment.
+> - **#17** — explicit idempotency patterns added to the migration conventions.
+> - **#2** (coupled, applied while restructuring the layout) — triggers are now created **before** the RLS policies that depend on them.
+>
+> The security-hardening tier (#4 cross-org `team_members` check, and the testing
+> gaps #5/#11/#12/#13/#15) is **not** folded here — it is tracked for the work-unit plan.
 
 ## Program context
 
@@ -24,7 +35,7 @@ Sub-project A is the bedrock. Nothing else can be built, let alone validated, wi
 1. The complete database schema (six tables) with constraints, triggers, and indexes.
 2. SECURITY DEFINER helper functions used by RLS policies.
 3. RLS policies on all six tables, per-operation, scoped `TO authenticated`.
-4. A one-time bootstrap migration that seeds the first organization + super admin from an env-supplied UID.
+4. A one-time bootstrap **script** (`supabase/bootstrap/seed_first_super_admin.sql`, outside the numbered migration chain) that seeds the first organization + super admin from an env-supplied UID.
 5. A verification script (`npm run verify:rls`) that proves tenant isolation against a real Supabase project using real JWTs.
 6. A minimal Vite + React skeleton (`index.html`, `src/main.tsx`, placeholder `App.tsx`) and `netlify.toml` so the deploy pipeline is wired end-to-end before sub-project B replaces the app shell.
 7. Regenerated `src/types/database.types.ts` committed alongside the migrations.
@@ -34,7 +45,7 @@ Sub-project A is the bedrock. Nothing else can be built, let alone validated, wi
 - Any React UI beyond the single Netlify-validation placeholder page.
 - `AuthContext` and route guards (sub-project B).
 - The list/todo UX (sub-project C).
-- User invitation, team management, role promotion flows (sub-projects D / E). The bootstrap migration is the *only* mechanism in this sub-project for putting a user into an org or promoting a super admin; everything else stays service-role / dashboard-only until D / E.
+- User invitation, team management, role promotion flows (sub-projects D / E). The bootstrap script is the *only* mechanism in this sub-project for putting a user into an org or promoting a super admin; everything else stays service-role / dashboard-only until D / E.
 
 ## Architecture decisions
 
@@ -60,9 +71,11 @@ Each user belongs to exactly one organization. Modeled as a non-null FK on `prof
 
 Cascade graph: org delete → teams, profiles, lists cascade; team delete → team_members and team-owned lists cascade; profile delete → personal lists, team_members cascade; list delete → todos cascade. Soft-delete was rejected — this sample doesn't need audit/restore, and the cascade graph is clean enough that re-deriving it after the fact would be more work than living with hard-delete from the start.
 
+**`lists.created_by` is the one exception to cascade-delete** (Codex #9). It is `ON DELETE SET NULL`, not cascade, because the ownership edges (`owner_user_id`, `owner_team_id`) already drive list deletion — `created_by` is audit-only metadata. If it cascaded, deleting a single member would wipe out *team* lists they happened to create (those lists belong to the team, not the creator, and should survive). If it had no action (the original `NOT NULL` with default `RESTRICT`), deleting that member would instead be **blocked** by the dangling reference — directly contradicting "profile delete → ... cascade." `SET NULL` is the only option consistent with the rest of the graph; the column is therefore nullable.
+
 ### `profiles.org_id` is NOT NULL — no "limbo profile"
 
-A user never exists in the system without an org. Profile rows are created server-side by service role during the invite flow (sub-project D) with the org already set. The very first super admin + first org are seeded by a one-shot bootstrap migration that takes a UID from an env var. There is no in-app sign-up.
+A user never exists in the system without an org. Profile rows are created server-side by service role during the invite flow (sub-project D) with the org already set. The very first super admin + first org are seeded by a one-shot bootstrap script that takes a UID from an env var. There is no in-app sign-up.
 
 ## Schema
 
@@ -130,7 +143,7 @@ CREATE TABLE public.lists (
   org_id          UUID NOT NULL REFERENCES public.organizations(id) ON DELETE CASCADE,
   owner_user_id   UUID NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
   owner_team_id   UUID NULL REFERENCES public.teams(id) ON DELETE CASCADE,
-  created_by      UUID NOT NULL REFERENCES public.profiles(id),
+  created_by      UUID NULL REFERENCES public.profiles(id) ON DELETE SET NULL,
   name            TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 120),
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -355,9 +368,9 @@ All access decisions delegate to the helpers, so future policy changes on lists 
    ```
    Clients cannot set `org_id` directly; it's derived. The XOR check on `lists` guarantees exactly one of the owners is set.
 
-3. **`lists_set_created_by` BEFORE INSERT** — `NEW.created_by := auth.uid()`. Always overrides whatever the client sent.
+3. **`lists_set_created_by` BEFORE INSERT** — `NEW.created_by := auth.uid()`. Always overrides whatever the client sent. Because this depends on a populated `auth.uid()`, fixture lists in `verify:rls` must be inserted through each owner's *authenticated* session, not the service role (see the seed step) — under service role `auth.uid()` is NULL and `created_by` would land NULL.
 
-4. **`lists_forbid_owner_change` BEFORE UPDATE** — rejects with an exception if any of `owner_user_id`, `owner_team_id`, `org_id`, `created_by` changed between OLD and NEW. Renames are fine; reparenting is not.
+4. **`lists_forbid_owner_change` BEFORE UPDATE** — rejects with an exception if `owner_user_id`, `owner_team_id`, or `org_id` changed between OLD and NEW. For `created_by` it rejects only a change to a *different non-null* value (`NEW.created_by IS DISTINCT FROM OLD.created_by AND NEW.created_by IS NOT NULL`) — this blocks a client reassigning the creator while still permitting the `ON DELETE SET NULL` cascade to drive `created_by → NULL` when the creator's profile is deleted. Renames are fine; reparenting is not.
 
 5. **`team_members_enforce_same_org` BEFORE INSERT**
    ```sql
@@ -370,7 +383,7 @@ All access decisions delegate to the helpers, so future policy changes on lists 
 
 ## Migration file layout
 
-Cloud-only (no local Postgres). Each migration is its own file, append-only, idempotent. Order matters because later migrations reference earlier objects.
+Cloud-only (no local Postgres). Each migration is its own file, append-only, idempotent. Order matters because later migrations reference earlier objects. The build order is **tables → helper functions → triggers → enable RLS → policies**; the bootstrap is deliberately *not* a migration (see below).
 
 ```
 supabase/migrations/
@@ -381,20 +394,43 @@ supabase/migrations/
   20260519100005_create_lists.sql
   20260519100006_alter_todos_for_lists.sql
   20260519100007_create_rls_helpers.sql
-  20260519100008_enable_rls.sql
-  20260519100009_create_profiles_policies.sql
-  20260519100010_create_organizations_policies.sql
-  20260519100011_create_teams_policies.sql
-  20260519100012_create_team_members_policies.sql
-  20260519100013_create_lists_policies.sql
-  20260519100014_create_todos_policies.sql
-  20260519100015_create_triggers.sql
-  20260519100016_bootstrap_first_super_admin.sql
+  20260519100008_create_triggers.sql          # moved BEFORE policies (Codex #2)
+  20260519100009_enable_rls.sql
+  20260519100010_create_profiles_policies.sql
+  20260519100011_create_organizations_policies.sql
+  20260519100012_create_teams_policies.sql
+  20260519100013_create_team_members_policies.sql
+  20260519100014_create_lists_policies.sql
+  20260519100015_create_todos_policies.sql
+
+supabase/bootstrap/
+  seed_first_super_admin.sql                   # NOT a migration (Codex #1)
 ```
+
+**Trigger ordering (Codex #2).** Triggers are created at `…08`, *before* the RLS policies at `…10`–`…15`. The `lists` INSERT/UPDATE policies assume `org_id` and `created_by` are trigger-derived (clients must not supply them); Postgres fires `BEFORE INSERT` triggers and *then* evaluates the policy `WITH CHECK` against the final row, so the trigger must already exist when the policy goes live. Creating policies first would leave a window where a write could pass an un-derived `org_id`. The triggers depend only on the tables (`…01`–`…06`), so this earlier slot is safe.
 
 The `alter_todos_for_lists` migration drops the README's planned `user_id` column from todos (if it existed) and adds the `list_id` FK. Since no todos exist yet in any deployed environment, the migration can `ALTER TABLE ... DROP COLUMN IF EXISTS user_id` without a data backfill.
 
-`bootstrap_first_super_admin.sql` reads two psql variables (`:super_admin_uid`, `:first_org_name`), creates the seed org, and inserts a profile pointing at the auth.users UID with `is_super_admin = true` and `role = 'org_admin'`. Run via `psql -v super_admin_uid='...' -v first_org_name='...' -f ...` after first deploy. The migration must be idempotent (`ON CONFLICT DO NOTHING`).
+### Bootstrap is a script, not a migration (Codex #1)
+
+`supabase/bootstrap/seed_first_super_admin.sql` is **outside** the numbered migration chain. It was originally numbered `…16` and "skipped" by `supabase:apply`, but `supabase db push` applies *every* file in `supabase/migrations/` in timestamp order — there is no skip mechanism — and the psql variable substitution it needs (`:super_admin_uid`) is a `psql` client feature the migration runner does not perform. Left in the chain it would either error during push or, if run by hand with `psql -f`, never be recorded in `supabase_migrations.schema_migrations` (so later `supabase db diff` reports drift).
+
+The script reads two psql variables (`:super_admin_uid`, `:first_org_name`), creates the seed org, and inserts a profile pointing at the `auth.users` UID with `is_super_admin = true` and `role = 'org_admin'`. It is idempotent (`ON CONFLICT DO NOTHING`). It is run once per environment via the dedicated `npm run bootstrap:first-admin` wrapper (see Bootstrap procedure), never via `supabase:apply`.
+
+### Idempotency patterns (Codex #17)
+
+"Append-only and idempotent" requires concrete patterns, because not every DDL form supports it. Every migration MUST use:
+
+- Tables: `CREATE TABLE IF NOT EXISTS`.
+- Columns: `ALTER TABLE … ADD COLUMN IF NOT EXISTS` / `DROP COLUMN IF EXISTS`.
+- Indexes: `CREATE INDEX IF NOT EXISTS`.
+- Functions: `CREATE OR REPLACE FUNCTION` (there is no `IF NOT EXISTS` for functions).
+- **Policies:** Postgres has **no** `CREATE POLICY IF NOT EXISTS`. Use the two-step form `DROP POLICY IF EXISTS <name> ON <table>; CREATE POLICY <name> …`.
+- Triggers: `DROP TRIGGER IF EXISTS <name> ON <table>; CREATE TRIGGER <name> …`.
+- Constraints added via `ALTER TABLE`: guard with a `DO $$ … IF NOT EXISTS (SELECT 1 FROM pg_constraint …) THEN … END $$;` block (no `ADD CONSTRAINT IF NOT EXISTS`).
+- Grants/revokes are naturally idempotent and need no guard.
+
+The SQL blocks shown earlier in this spec are illustrative of *intent*; the implemented migrations apply these idempotent forms.
 
 ## Bootstrap procedure
 
@@ -402,10 +438,10 @@ The full deploy-to-running-system sequence, executed once per environment:
 
 1. Create a new Supabase project in the dashboard.
 2. `supabase link --project-ref <ref>`.
-3. `npm run supabase:apply` — pushes migrations 1–15. Migration 16 is skipped here because it requires a UID.
+3. `npm run supabase:apply` — pushes all 15 migrations. (The bootstrap script lives in `supabase/bootstrap/`, not `supabase/migrations/`, so it is not touched here.)
 4. In the Supabase dashboard, sign up the first super admin via Auth → Users (email + password).
 5. Copy that user's UID from the dashboard.
-6. Run migration 16 manually: `psql $SUPABASE_DB_URL -v super_admin_uid='<uid>' -v first_org_name='System' -f supabase/migrations/20260519100016_bootstrap_first_super_admin.sql`.
+6. Run the bootstrap script: `npm run bootstrap:first-admin -- --uid '<uid>' --org 'System'` (wraps `psql $SUPABASE_DB_URL -v super_admin_uid='<uid>' -v first_org_name='System' -f supabase/bootstrap/seed_first_super_admin.sql`).
 7. `npm run gen:types` — regenerate `src/types/database.types.ts`. Commit alongside the migrations.
 8. Create a Netlify site from the repo. Set env vars: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`. Trigger a deploy.
 9. Visit the deployed URL. The placeholder page should render "anonymous read of lists returned: 0 rows" — proving the deploy works and RLS rejects unauthenticated access from a real browser.
@@ -424,9 +460,10 @@ A Node script at `scripts/verify-rls.ts`, run via `npm run verify:rls`. Uses `@s
 
 1. **Wipe**: using service role, `TRUNCATE` the six `public.*` tables (CASCADE). Do **not** truncate `auth.users` — that's invasive and the script doesn't own it.
 2. **Ensure fixture users exist** (idempotent): for each of the five known fixture emails, call the Supabase Admin API to create the user with a known password (`createUser`) or fetch the existing UID if creation returns "already exists". Cache the resulting UIDs for the seed step. This step is a no-op on subsequent runs.
-3. **Seed**: create two organizations ("Acme", "Globex"); two users per org (one `org_admin`, one `member`); two teams per org with crisscrossed membership (member A on team 1 only, org_admin A on teams 1+2, etc.); a personal list for each user; a team list for each team; 2 todos per list. Plus one super-admin user not assigned to any org other than the seed "System" org. All inserts go through the Supabase Admin API so they bypass RLS and exercise the triggers correctly (`org_id` auto-fill, `created_by` capture).
-4. **Sign in**: for each of the five user fixtures, sign in via `supabase.auth.signInWithPassword` and produce a user-scoped client (using the returned JWT). The seed sets each user's password to a known value.
-5. **Assert**: run the assertion list below. Each assertion is "as user X, query Y, expect Z." Failures collect into an error report; the script exits nonzero on any failure with a per-assertion diff.
+3. **Seed tenancy (service role)**: create two organizations ("Acme", "Globex"); two users per org (one `org_admin`, one `member`); two teams per org with crisscrossed membership (member A on team 1 only, org_admin A on teams 1+2, etc.). Plus one super-admin user not assigned to any org other than the seed "System" org. These rows — `organizations`, `profiles`, `teams`, `team_members` — go through the Supabase Admin API (service role), which bypasses RLS and exercises the `team_members_enforce_same_org` trigger.
+4. **Sign in**: for each user fixture, sign in via `supabase.auth.signInWithPassword` and produce a user-scoped client (using the returned JWT). The seed sets each user's password to a known value.
+5. **Seed lists + todos (authenticated — Codex #8)**: create each personal list, team list, and the 2 todos per list **through the owning user's authenticated client from step 4**, *not* the service role. This is mandatory: `lists_set_created_by` and `lists_set_org_id_from_owner` derive `created_by`/`org_id` from `auth.uid()`, which is NULL under the service role — service-role list inserts would write `created_by = NULL` (and, since `created_by` is now `ON DELETE SET NULL` nullable, do so silently rather than erroring) and skip the org-derivation path. Creating lists via the real session also exercises the `lists` INSERT policies as a side benefit.
+6. **Assert**: run the assertion list below. Each assertion is "as user X, query Y, expect Z." Failures collect into an error report; the script exits nonzero on any failure with a per-assertion diff.
 
 ### Assertion list (representative — full list lives in the script)
 
@@ -501,8 +538,11 @@ Sub-project B replaces this entire `App.tsx` with the routed, auth-gated applica
 
 ```
 "verify:rls": "tsx scripts/verify-rls.ts",
+"bootstrap:first-admin": "tsx scripts/bootstrap-first-admin.ts",
 "build": "tsc && vite build"
 ```
+
+`bootstrap:first-admin` is a thin wrapper around the `supabase/bootstrap/seed_first_super_admin.sql` script: it reads `--uid` / `--org` args (or `SUPER_ADMIN_UID` / `FIRST_ORG_NAME` env) and invokes `psql $SUPABASE_DB_URL -v super_admin_uid=… -v first_org_name=… -f supabase/bootstrap/seed_first_super_admin.sql`. It is deliberately separate from `supabase:apply` so the bootstrap never rides the migration runner (Codex #1).
 
 Per the README convention, `gen:types`, `supabase:apply`, `db:psql`, and the lint/test scripts are already documented and will be wired up alongside the initial Vite scaffold.
 
@@ -510,7 +550,7 @@ Per the README convention, `gen:types`, `supabase:apply`, `db:psql`, and the lin
 
 Sub-project A is complete when *every* item below is true. No partial completion.
 
-1. All 16 migrations applied to a target Supabase project; `supabase db diff` shows no drift.
+1. All 15 migrations applied to a target Supabase project; `supabase db diff` shows no drift. (The bootstrap script in `supabase/bootstrap/` is not a migration and is excluded from this count and from `db diff`.)
 2. `src/types/database.types.ts` regenerated and committed in the same commit as the migrations.
 3. `npm run verify:rls` exits 0 against a clean Supabase test project. The script's assertion list is fully implemented (not stubbed).
 4. The bootstrap procedure has been executed end-to-end on a real Supabase project at least once, producing a working super admin login.
